@@ -1,0 +1,9 @@
+#!/bin/zsh
+set -euo pipefail
+
+if [[ -x "./scripts/secret_scan.sh" ]]; then
+  ./scripts/secret_scan.sh
+else
+  echo "[pre-commit] missing scripts/secret_scan.sh"
+  exit 1
+fi

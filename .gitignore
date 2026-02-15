@@ -1,0 +1,26 @@
+# Built binary
+/telegram-codex-bridge
+/telegent
+
+# Runtime logs
+/tmp/
+/tmp/logs/
+/tmp/chat-history.jsonl
+/dist/
+*.log
+.DS_Store
+
+# Local secrets/config
+.env
+.env.*
+!.env.example
+*.local
+*.secret
+secrets/
+
+# Git reset backups
+.git.backup.*/
+.git-rewrite/
+
+# macOS/iCloud temp artifacts
+.!*

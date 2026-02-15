@@ -1,0 +1,46 @@
+name: Build macOS App
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  build-macos:
+    runs-on: macos-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Build app bundle
+        run: |
+          chmod +x ./scripts/build_macos_app.sh
+          ./scripts/build_macos_app.sh
+
+      - name: Archive app
+        run: |
+          ditto -c -k --sequesterRsrc --keepParent ./dist/telegent.app ./dist/telegent-macos.zip
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: telegent-macos
+          path: ./dist/telegent-macos.zip
+          if-no-files-found: error
+
+      - name: Publish GitHub Release asset
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ./dist/telegent-macos.zip
+          generate_release_notes: true
+
