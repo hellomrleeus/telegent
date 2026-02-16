@@ -318,6 +318,9 @@ static NSString *const kTelegentLangEN = @"en";
 @property(nonatomic, strong) NSImage *statusIconError;
 @property(nonatomic, assign) BOOL startupFailed;
 @property(nonatomic, copy) NSString *languageCode;
+@property(nonatomic, strong) NSDate *chatHistoryLastModifiedAt;
+@property(nonatomic, assign) NSTimeInterval chatHistoryLastPollTs;
+@property(nonatomic, assign) NSTimeInterval chatHistoryPollInterval;
 @end
 
 @implementation AppDelegate
@@ -408,6 +411,8 @@ static NSString *const kTelegentLangEN = @"en";
     if (error) [self showError:error.localizedDescription];
     [self refresh];
 
+    self.chatHistoryPollInterval = 2.0;
+    self.chatHistoryLastPollTs = 0;
     [NSTimer scheduledTimerWithTimeInterval:1.0 target:self selector:@selector(refreshTimer) userInfo:nil repeats:YES];
 }
 
@@ -893,16 +898,7 @@ static NSString *const kTelegentLangEN = @"en";
     item.label = [self L:@"对话" en:@"Chat"];
 
     NSView *root = [self makeTabContainer];
-
-    NSButton *refresh = [[NSButton alloc] initWithFrame:NSMakeRect(20, 595, 140, 30)];
-    refresh.title = [self L:@"刷新对话记录" en:@"Reload Chat"];
-    refresh.bezelStyle = NSBezelStyleRounded;
-    refresh.target = self;
-    refresh.action = @selector(reloadChatHistory);
-    refresh.autoresizingMask = NSViewMinYMargin;
-    [root addSubview:refresh];
-
-    NSButton *clear = [[NSButton alloc] initWithFrame:NSMakeRect(170, 595, 140, 30)];
+    NSButton *clear = [[NSButton alloc] initWithFrame:NSMakeRect(20, 595, 140, 30)];
     clear.title = [self L:@"清空对话记录" en:@"Clear Chat"];
     clear.bezelStyle = NSBezelStyleRounded;
     clear.target = self;
@@ -939,7 +935,7 @@ static NSString *const kTelegentLangEN = @"en";
 
     item.view = root;
     [self.tabView addTabViewItem:item];
-    [self reloadChatHistory];
+    [self reloadChatHistoryIfNeeded:YES];
 }
 
 - (NSString *)runCommandCapture:(NSString *)bin args:(NSArray<NSString *> *)args {
@@ -1260,11 +1256,23 @@ static NSString *const kTelegentLangEN = @"en";
     [self renderChatHistoryFromJSONL:raw];
 }
 
+- (void)reloadChatHistoryIfNeeded:(BOOL)force {
+    NSString *path = [self.bridge resolvedEnvironment][@"CHAT_LOG_FILE"];
+    NSDictionary<NSFileAttributeKey, id> *attrs = [[NSFileManager defaultManager] attributesOfItemAtPath:path error:nil];
+    NSDate *mtime = attrs[NSFileModificationDate];
+    if (!force && self.chatHistoryLastModifiedAt && mtime && [mtime isEqualToDate:self.chatHistoryLastModifiedAt]) {
+        return;
+    }
+        [self reloadChatHistory];
+    self.chatHistoryLastModifiedAt = mtime ?: [NSDate date];
+}
+
 - (void)clearChatHistory {
     NSString *path = [self.bridge resolvedEnvironment][@"CHAT_LOG_FILE"];
     [self clearFileAtPath:path];
     [self clearTempImages];
     [self clearChatHistoryRows];
+    self.chatHistoryLastModifiedAt = nil;
 }
 
 - (NSString *)chatTimeFromRFC3339:(NSString *)ts {
@@ -1668,7 +1676,7 @@ static NSString *const kTelegentLangEN = @"en";
     if (notification.object != self.controlWindow) return;
     if ([self.tabView.selectedTabViewItem.identifier isKindOfClass:[NSString class]] &&
         [self.tabView.selectedTabViewItem.identifier isEqualToString:@"chat"]) {
-        [self reloadChatHistory];
+        [self reloadChatHistoryIfNeeded:YES];
     }
 }
 
@@ -2060,6 +2068,13 @@ static NSString *const kTelegentLangEN = @"en";
     if ([self isPermissionTabSelected]) {
         [self refreshPermissions];
     }
+    if ([self isChatTabSelected]) {
+        NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
+        if (now - self.chatHistoryLastPollTs >= self.chatHistoryPollInterval) {
+            self.chatHistoryLastPollTs = now;
+            [self reloadChatHistoryIfNeeded:NO];
+        }
+    }
 }
 
 - (void)refresh {
@@ -2083,11 +2098,20 @@ static NSString *const kTelegentLangEN = @"en";
     return [ident isKindOfClass:[NSString class]] && [(NSString *)ident isEqualToString:@"perm"];
 }
 
+- (BOOL)isChatTabSelected {
+    id ident = self.tabView.selectedTabViewItem.identifier;
+    return [ident isKindOfClass:[NSString class]] && [(NSString *)ident isEqualToString:@"chat"];
+}
+
 - (void)tabView:(NSTabView *)tabView didSelectTabViewItem:(nullable NSTabViewItem *)tabViewItem {
     (void)tabView;
     if ([tabViewItem.identifier isKindOfClass:[NSString class]] &&
         [(NSString *)tabViewItem.identifier isEqualToString:@"perm"]) {
         [self refreshPermissions];
+    }
+    if ([tabViewItem.identifier isKindOfClass:[NSString class]] &&
+        [(NSString *)tabViewItem.identifier isEqualToString:@"chat"]) {
+        [self reloadChatHistoryIfNeeded:YES];
     }
 }
 
