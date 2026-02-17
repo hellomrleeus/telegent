@@ -46,3 +46,18 @@ Disallowed by default:
 2. Safety and data integrity
 3. This AGENTS.md policy
 4. Reasonable defaults for speed
+
+## Skills
+
+A skill is a set of local instructions stored in a `SKILL.md` file.
+
+### Available skills
+
+- desktop-control: Maintain Telegent desktop automation prompts for macOS GUI task intent classification and screenshot-based action planning. (file: `skills/desktop-control/SKILL.md`)
+
+### How to use skills
+
+- Trigger: If user names a skill (e.g. `$desktop-control`) or the task clearly matches a skill description, use that skill in this turn.
+- Load minimally: Open the target `SKILL.md` and read only what is needed to complete the task.
+- Path resolution: Resolve relative paths from the skill directory first.
+- Fallback: If skill files are missing or unreadable, state the issue briefly and continue with the best fallback approach.

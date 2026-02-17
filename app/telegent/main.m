@@ -7,6 +7,12 @@
 static NSString *const kTelegentLanguageKey = @"telegentLanguage";
 static NSString *const kTelegentLangZH = @"zh-Hans";
 static NSString *const kTelegentLangEN = @"en";
+static NSString *const kTabConfig = @"config";
+static NSString *const kTabPermission = @"perm";
+static NSString *const kTabLogs = @"logs";
+static NSString *const kTabChat = @"chat";
+static NSString *const kTabCodexCheck = @"codex-check";
+static NSString *const kTabMemory = @"memory";
 
 @interface BridgeController : NSObject
 @property(nonatomic, strong) NSTask *task;
@@ -25,9 +31,24 @@ static NSString *const kTelegentLangEN = @"en";
 - (NSDictionary<NSString *, NSString *> *)loadStoredConfig;
 - (void)saveStoredConfig:(NSDictionary<NSString *, NSString *> *)config;
 - (void)cleanupResidualCoreProcesses;
+- (NSString *)resolvedWorkdirPath;
+- (NSString *)normalizedWorkdirPathFromRaw:(NSString *)raw;
+- (BOOL)initializeSkillsInWorkspace:(NSString *)workdir error:(NSError **)error;
 @end
 
 @implementation BridgeController
+
+- (NSString *)shellSingleQuote:(NSString *)text {
+    if (text.length == 0) return @"''";
+    return [NSString stringWithFormat:@"'%@'", [text stringByReplacingOccurrencesOfString:@"'" withString:@"'\\''"]];
+}
+
+- (NSString *)appleScriptEscape:(NSString *)text {
+    if (text.length == 0) return @"";
+    NSString *escaped = [text stringByReplacingOccurrencesOfString:@"\\" withString:@"\\\\"];
+    escaped = [escaped stringByReplacingOccurrencesOfString:@"\"" withString:@"\\\""];
+    return escaped;
+}
 
 - (NSString *)readLogTail:(NSUInteger)maxBytes {
     NSData *data = [NSData dataWithContentsOfFile:self.logPath];
@@ -66,7 +87,8 @@ static NSString *const kTelegentLangEN = @"en";
         @"AGENT_ARGS": @"",
         @"AGENT_MODEL": @"",
         @"AGENT_SUPPORTS_IMAGE": @"true",
-        @"CODEX_WORKDIR": self.repoRoot,
+        @"SKILLS_INIT_DIR": @"",
+        @"CODEX_WORKDIR": @"",
         @"CODEX_BIN": @"/Applications/Codex.app/Contents/Resources/codex",
         @"WHISPER_PYTHON_BIN": @"python3",
         @"WHISPER_SCRIPT": whisperScript,
@@ -141,6 +163,10 @@ static NSString *const kTelegentLangEN = @"en";
 - (NSError *)start {
     if ([self isRunning]) return nil;
     [self cleanupResidualCoreProcesses];
+    NSString *workdir = [self resolvedWorkdirPath];
+    if (workdir.length == 0) {
+        return [NSError errorWithDomain:@"telegent" code:11 userInfo:@{NSLocalizedDescriptionKey: @"CODEX_WORKDIR 为空。请先在配置页选择工作目录。"}];
+    }
 
     if (![[NSFileManager defaultManager] isExecutableFileAtPath:self.corePath]) {
         return [NSError errorWithDomain:@"telegent" code:1 userInfo:@{NSLocalizedDescriptionKey: [NSString stringWithFormat:@"Missing core binary: %@", self.corePath]}];
@@ -163,6 +189,7 @@ static NSString *const kTelegentLangEN = @"en";
 
     NSMutableDictionary<NSString *, NSString *> *env = [NSMutableDictionary dictionaryWithDictionary:[[NSProcessInfo processInfo] environment]];
     [env addEntriesFromDictionary:[self resolvedEnvironment]];
+    env[@"CODEX_WORKDIR"] = workdir;
     env[@"BRIDGE_PARENT_PID"] = [NSString stringWithFormat:@"%d", getpid()];
 
     NSFileHandle *logHandle = [NSFileHandle fileHandleForWritingAtPath:self.logPath];
@@ -170,7 +197,7 @@ static NSString *const kTelegentLangEN = @"en";
 
     NSTask *task = [[NSTask alloc] init];
     task.executableURL = [NSURL fileURLWithPath:self.corePath];
-    task.currentDirectoryURL = [NSURL fileURLWithPath:self.repoRoot];
+    task.currentDirectoryURL = [NSURL fileURLWithPath:workdir];
     task.environment = env;
     task.standardOutput = logHandle;
     task.standardError = logHandle;
@@ -206,6 +233,96 @@ static NSString *const kTelegentLangEN = @"en";
     }
 
     return nil;
+}
+
+- (NSString *)resolvedWorkdirPath {
+    NSString *raw = [self resolvedEnvironment][@"CODEX_WORKDIR"];
+    return [self normalizedWorkdirPathFromRaw:raw];
+}
+
+- (NSString *)normalizedWorkdirPathFromRaw:(NSString *)raw {
+    NSString *trimmed = [raw stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    if (trimmed.length == 0) return @"";
+    NSString *expanded = [trimmed stringByExpandingTildeInPath];
+    if (![expanded hasPrefix:@"/"]) {
+        expanded = [self.repoRoot stringByAppendingPathComponent:expanded];
+    }
+    NSString *standard = [expanded stringByStandardizingPath];
+    BOOL isDir = NO;
+    if ([[NSFileManager defaultManager] fileExistsAtPath:standard isDirectory:&isDir] && isDir) {
+        return standard;
+    }
+    return @"";
+}
+
+- (BOOL)initializeSkillsInWorkspace:(NSString *)workdir error:(NSError **)error {
+    NSString *workspace = [self normalizedWorkdirPathFromRaw:workdir];
+    if (workspace.length == 0) {
+        if (error) {
+            *error = [NSError errorWithDomain:@"telegent" code:30 userInfo:@{NSLocalizedDescriptionKey: @"工作目录无效，无法初始化 SKILLS。"}];
+        }
+        return NO;
+    }
+
+    NSString *installedSkill = [NSHomeDirectory() stringByAppendingPathComponent:@".codex/skills/desktop-control/SKILL.md"];
+    if ([[NSFileManager defaultManager] fileExistsAtPath:installedSkill]) {
+        return YES;
+    }
+
+    NSString *workspaceQuoted = [self shellSingleQuote:workspace];
+    NSString *terminalScript = [NSString stringWithFormat:
+                                @"cd %@; "
+                                "if [ -d \"$HOME/.codex/skills/desktop-control\" ]; then exit 0; fi; "
+                                "if [ -f \"$HOME/.codex/skills/.system/skill-installer/scripts/install-skill-from-github.py\" ]; then "
+                                "python3 \"$HOME/.codex/skills/.system/skill-installer/scripts/install-skill-from-github.py\" --repo patrickporto/desktop-agent --path . --name desktop-control; "
+                                "else "
+                                "npx -y skills add https://github.com/patrickporto/desktop-agent --skill 'Desktop Control'; "
+                                "fi; "
+                                "exit",
+                                workspaceQuoted];
+    NSString *terminalScriptEscaped = [self appleScriptEscape:terminalScript];
+    NSString *osaProgram = [NSString stringWithFormat:
+                            @"tell application \"Terminal\"\n"
+                            "activate\n"
+                            "set installTab to do script \"%@\"\n"
+                            "repeat while busy of installTab\n"
+                            "delay 0.2\n"
+                            "end repeat\n"
+                            "try\n"
+                            "close (first window whose selected tab is installTab) saving no\n"
+                            "end try\n"
+                            "end tell",
+                            terminalScriptEscaped];
+
+    NSTask *osascriptTask = [[NSTask alloc] init];
+    osascriptTask.executableURL = [NSURL fileURLWithPath:@"/usr/bin/osascript"];
+    osascriptTask.arguments = @[@"-e", osaProgram];
+    NSPipe *errPipe = [NSPipe pipe];
+    osascriptTask.standardError = errPipe;
+    osascriptTask.standardOutput = [NSPipe pipe];
+    NSError *launchErr = nil;
+    if (![osascriptTask launchAndReturnError:&launchErr]) {
+        if (error) {
+            *error = [NSError errorWithDomain:@"telegent" code:31 userInfo:@{NSLocalizedDescriptionKey: [NSString stringWithFormat:@"拉起 Terminal 安装 desktop-control 失败: %@", launchErr.localizedDescription ?: @"unknown"]}];
+        }
+        return NO;
+    }
+    [osascriptTask waitUntilExit];
+    if (osascriptTask.terminationStatus != 0) {
+        NSData *errData = [[errPipe fileHandleForReading] readDataToEndOfFile];
+        NSString *errText = [[NSString alloc] initWithData:errData encoding:NSUTF8StringEncoding];
+        if (error) {
+            *error = [NSError errorWithDomain:@"telegent" code:32 userInfo:@{NSLocalizedDescriptionKey: [NSString stringWithFormat:@"desktop-control 安装失败: %@", (errText.length > 0 ? errText : @"Terminal/AppleScript error")]}];
+        }
+        return NO;
+    }
+    if (![[NSFileManager defaultManager] fileExistsAtPath:installedSkill]) {
+        if (error) {
+            *error = [NSError errorWithDomain:@"telegent" code:33 userInfo:@{NSLocalizedDescriptionKey: @"desktop-control 安装未完成：未找到 ~/.codex/skills/desktop-control/SKILL.md"}];
+        }
+        return NO;
+    }
+    return YES;
 }
 
 - (void)cleanupResidualCoreProcesses {
@@ -294,7 +411,6 @@ static NSString *const kTelegentLangEN = @"en";
 @property(nonatomic, strong) NSMutableDictionary<NSString *, NSTextField *> *configFields;
 @property(nonatomic, strong) NSTextField *configHint;
 @property(nonatomic, strong) NSSwitch *screenSwitch;
-@property(nonatomic, strong) NSSwitch *axSwitch;
 @property(nonatomic, strong) NSSwitch *micSwitch;
 @property(nonatomic, strong) NSSwitch *camSwitch;
 @property(nonatomic, strong) NSTextField *permHint;
@@ -321,6 +437,13 @@ static NSString *const kTelegentLangEN = @"en";
 @property(nonatomic, strong) NSDate *chatHistoryLastModifiedAt;
 @property(nonatomic, assign) NSTimeInterval chatHistoryLastPollTs;
 @property(nonatomic, assign) NSTimeInterval chatHistoryPollInterval;
+@property(nonatomic, strong) NSTimer *refreshTickTimer;
+@property(nonatomic, copy) NSString *lastAutoRefreshTabIdentifier;
+@property(nonatomic, assign) NSTimeInterval lastAutoRefreshAt;
+- (NSString *)selectedTabIdentifier;
+- (void)refreshTabWithIdentifier:(NSString *)identifier force:(BOOL)force;
+- (void)refreshSelectedTabForFocus;
+- (void)refreshTabForAutoEventWithIdentifier:(NSString *)identifier force:(BOOL)force;
 @end
 
 @implementation AppDelegate
@@ -413,7 +536,9 @@ static NSString *const kTelegentLangEN = @"en";
 
     self.chatHistoryPollInterval = 2.0;
     self.chatHistoryLastPollTs = 0;
-    [NSTimer scheduledTimerWithTimeInterval:1.0 target:self selector:@selector(refreshTimer) userInfo:nil repeats:YES];
+    // Disable periodic timer refresh for now: recent crashes consistently
+    // point to refreshTimer callback; UI still refreshes on user actions.
+    self.refreshTickTimer = nil;
 }
 
 - (void)setupMainMenu {
@@ -446,7 +571,14 @@ static NSString *const kTelegentLangEN = @"en";
 
 - (void)applicationWillTerminate:(NSNotification *)notification {
     (void)notification;
+    [self.refreshTickTimer invalidate];
+    self.refreshTickTimer = nil;
     [self.bridge stop];
+}
+
+- (void)applicationDidBecomeActive:(NSNotification *)notification {
+    (void)notification;
+    [self refreshSelectedTabForFocus];
 }
 
 - (BOOL)applicationShouldHandleReopen:(NSApplication *)sender hasVisibleWindows:(BOOL)flag {
@@ -594,7 +726,7 @@ static NSString *const kTelegentLangEN = @"en";
 }
 
 - (void)buildConfigTab {
-    NSTabViewItem *item = [[NSTabViewItem alloc] initWithIdentifier:@"config"];
+    NSTabViewItem *item = [[NSTabViewItem alloc] initWithIdentifier:kTabConfig];
     item.label = [self L:@"配置" en:@"Config"];
 
     NSView *root = [self makeTabContainer];
@@ -609,6 +741,7 @@ static NSString *const kTelegentLangEN = @"en";
         @{@"group": @"Agent 执行", @"key": @"AGENT_ARGS", @"label": @"Agent 固定参数"},
         @{@"group": @"Agent 执行", @"key": @"AGENT_MODEL", @"label": @"Agent 模型(可选)"},
         @{@"group": @"Agent 执行", @"key": @"AGENT_SUPPORTS_IMAGE", @"label": @"Agent 支持图片输入"},
+        @{@"group": @"Agent 执行", @"key": @"SKILLS_INIT_DIR", @"label": @"SKILLS 初始化目录(可选)"},
         @{@"group": @"Agent 执行", @"key": @"CODEX_WORKDIR", @"label": @"工作目录"},
         @{@"group": @"Agent 执行", @"key": @"CODEX_TIMEOUT_SEC", @"label": @"执行超时(秒)"},
         @{@"group": @"Agent 执行", @"key": @"MAX_REPLY_CHARS", @"label": @"最大回复字符数"},
@@ -676,7 +809,11 @@ static NSString *const kTelegentLangEN = @"en";
         label.editable = NO;
         label.selectable = NO;
 
-        NSTextField *field = [[NSTextField alloc] initWithFrame:NSMakeRect(300, y - 30, 580, 28)];
+        CGFloat fieldWidth = 580.0;
+        if ([key isEqualToString:@"CODEX_WORKDIR"]) {
+            fieldWidth = 440.0;
+        }
+        NSTextField *field = [[NSTextField alloc] initWithFrame:NSMakeRect(300, y - 30, fieldWidth, 28)];
         field.placeholderString = @"(empty)";
         field.selectable = YES;
         field.editable = YES;
@@ -694,6 +831,15 @@ static NSString *const kTelegentLangEN = @"en";
         [form addSubview:label];
         [form addSubview:field];
         self.configFields[key] = field;
+        if ([key isEqualToString:@"CODEX_WORKDIR"]) {
+            NSButton *pickFolder = [[NSButton alloc] initWithFrame:NSMakeRect(748, y - 30, 132, 28)];
+            pickFolder.title = [self L:@"选择目录..." en:@"Choose Folder..."];
+            pickFolder.bezelStyle = NSBezelStyleRounded;
+            pickFolder.target = self;
+            pickFolder.action = @selector(chooseWorkdirFolder);
+            pickFolder.autoresizingMask = NSViewMinXMargin;
+            [form addSubview:pickFolder];
+        }
         y -= 46;
     }
     scroll.documentView = form;
@@ -747,92 +893,103 @@ static NSString *const kTelegentLangEN = @"en";
 }
 
 - (void)buildPermissionTab {
-    NSTabViewItem *item = [[NSTabViewItem alloc] initWithIdentifier:@"perm"];
+    NSTabViewItem *item = [[NSTabViewItem alloc] initWithIdentifier:kTabPermission];
     item.label = [self L:@"授权" en:@"Permissions"];
 
     NSView *root = [self makeTabContainer];
 
-    NSButton *openScreen = [[NSButton alloc] initWithFrame:NSMakeRect(20, 590, 220, 30)];
-    openScreen.title = [self L:@"打开屏幕录制设置" en:@"Open Screen Recording Settings"];
-    openScreen.bezelStyle = NSBezelStyleRounded;
-    openScreen.target = self;
-    openScreen.action = @selector(openScreenRecordingSettings);
-    openScreen.autoresizingMask = NSViewMinYMargin;
-    [root addSubview:openScreen];
-
-    NSButton *requestScreen = [[NSButton alloc] initWithFrame:NSMakeRect(250, 590, 220, 30)];
-    requestScreen.title = [self L:@"请求屏幕录制授权" en:@"Request Screen Recording Access"];
-    requestScreen.bezelStyle = NSBezelStyleRounded;
-    requestScreen.target = self;
-    requestScreen.action = @selector(requestScreenRecordingAccess);
-    requestScreen.autoresizingMask = NSViewMinYMargin;
-    [root addSubview:requestScreen];
-
-    NSButton *openAccessibility = [[NSButton alloc] initWithFrame:NSMakeRect(480, 590, 220, 30)];
-    openAccessibility.title = [self L:@"打开辅助功能设置" en:@"Open Accessibility Settings"];
-    openAccessibility.bezelStyle = NSBezelStyleRounded;
-    openAccessibility.target = self;
-    openAccessibility.action = @selector(openAccessibilitySettings);
-    openAccessibility.autoresizingMask = NSViewMinYMargin;
-    [root addSubview:openAccessibility];
-
-    NSTextField *title = [[NSTextField alloc] initWithFrame:NSMakeRect(20, 540, 300, 28)];
-    title.stringValue = [self L:@"权限开关（当前 Mac 状态）" en:@"Permission switches (current Mac status)"];
+    NSTextField *title = [[NSTextField alloc] initWithFrame:NSMakeRect(28, 592, 420, 28)];
+    title.stringValue = [self L:@"权限控制" en:@"Permission Control"];
     title.bezeled = NO;
     title.drawsBackground = NO;
     title.editable = NO;
     title.selectable = NO;
-    title.font = [NSFont boldSystemFontOfSize:16];
+    title.font = [NSFont boldSystemFontOfSize:20];
     title.autoresizingMask = NSViewMinYMargin;
     [root addSubview:title];
 
+    NSTextField *subtitle = [[NSTextField alloc] initWithFrame:NSMakeRect(28, 566, 880, 20)];
+    subtitle.stringValue = [self L:@"点击开关即可触发对应权限授权或跳转系统设置。" en:@"Toggle a switch to request permission or open the related system settings."];
+    subtitle.bezeled = NO;
+    subtitle.drawsBackground = NO;
+    subtitle.editable = NO;
+    subtitle.selectable = NO;
+    subtitle.textColor = [NSColor secondaryLabelColor];
+    subtitle.font = [NSFont systemFontOfSize:12];
+    subtitle.autoresizingMask = NSViewWidthSizable | NSViewMinYMargin;
+    [root addSubview:subtitle];
+
+    NSBox *card = [[NSBox alloc] initWithFrame:NSMakeRect(28, 276, 904, 268)];
+    card.boxType = NSBoxCustom;
+    card.borderColor = [NSColor colorWithWhite:1 alpha:0.12];
+    card.borderWidth = 1.0;
+    card.fillColor = [NSColor colorWithWhite:1 alpha:0.03];
+    card.cornerRadius = 12.0;
+    card.autoresizingMask = NSViewWidthSizable | NSViewMinYMargin;
+    [root addSubview:card];
+
     NSArray<NSDictionary<NSString *, id> *> *rows = @[
-        @{@"name": [self L:@"屏幕录制" en:@"Screen Recording"], @"tag": @1, @"action": @"openScreenRecordingSettings"},
-        @{@"name": [self L:@"辅助功能" en:@"Accessibility"], @"tag": @2, @"action": @"openAccessibilitySettings"},
-        @{@"name": [self L:@"麦克风" en:@"Microphone"], @"tag": @3, @"action": @"openMicrophoneSettings"},
-        @{@"name": [self L:@"摄像头" en:@"Camera"], @"tag": @4, @"action": @"openCameraSettings"}
+        @{@"name": [self L:@"屏幕录制" en:@"Screen Recording"], @"desc": [self L:@"用于截图与屏幕录制反馈" en:@"Used for screenshot and screen recording feedback"], @"tag": @1},
+        @{@"name": [self L:@"麦克风" en:@"Microphone"], @"desc": [self L:@"用于语音指令识别" en:@"Used for voice command recognition"], @"tag": @2},
+        @{@"name": [self L:@"摄像头" en:@"Camera"], @"desc": [self L:@"仅在拍摄输入时需要" en:@"Only needed when camera input is used"], @"tag": @3}
     ];
 
-    CGFloat y = 490;
-    for (NSDictionary<NSString *, id> *row in rows) {
-        NSTextField *label = [[NSTextField alloc] initWithFrame:NSMakeRect(40, y + 6, 140, 24)];
+    CGFloat rowHeight = 64.0;
+    CGFloat rowTop = card.frame.origin.y + card.frame.size.height - rowHeight;
+    for (NSUInteger i = 0; i < rows.count; i++) {
+        NSDictionary<NSString *, id> *row = rows[i];
+        CGFloat y = rowTop - (CGFloat)i * rowHeight;
+
+        if (i > 0) {
+            NSBox *line = [[NSBox alloc] initWithFrame:NSMakeRect(52, y + rowHeight - 1, 856, 1)];
+            line.boxType = NSBoxSeparator;
+            line.borderColor = [NSColor colorWithWhite:1 alpha:0.08];
+            line.autoresizingMask = NSViewWidthSizable | NSViewMinYMargin;
+            [root addSubview:line];
+        }
+
+        NSTextField *label = [[NSTextField alloc] initWithFrame:NSMakeRect(52, y + 32, 260, 22)];
         label.stringValue = row[@"name"];
         label.bezeled = NO;
         label.drawsBackground = NO;
         label.editable = NO;
         label.selectable = NO;
+        label.font = [NSFont systemFontOfSize:14 weight:NSFontWeightSemibold];
+        label.autoresizingMask = NSViewMaxXMargin | NSViewMinYMargin;
         [root addSubview:label];
 
-        NSSwitch *sw = [[NSSwitch alloc] initWithFrame:NSMakeRect(190, y + 2, 60, 32)];
+        NSTextField *desc = [[NSTextField alloc] initWithFrame:NSMakeRect(52, y + 12, 520, 18)];
+        desc.stringValue = row[@"desc"] ?: @"";
+        desc.bezeled = NO;
+        desc.drawsBackground = NO;
+        desc.editable = NO;
+        desc.selectable = NO;
+        desc.textColor = [NSColor secondaryLabelColor];
+        desc.font = [NSFont systemFontOfSize:12];
+        desc.autoresizingMask = NSViewWidthSizable | NSViewMinYMargin;
+        [root addSubview:desc];
+
+        NSSwitch *sw = [[NSSwitch alloc] initWithFrame:NSMakeRect(840, y + 16, 52, 32)];
         sw.tag = [row[@"tag"] integerValue];
         sw.target = self;
         sw.action = @selector(permissionSwitchChanged:);
+        sw.autoresizingMask = NSViewMinXMargin | NSViewMinYMargin;
         [root addSubview:sw];
 
-        NSButton *btn = [[NSButton alloc] initWithFrame:NSMakeRect(280, y + 2, 200, 30)];
-        btn.title = [self L:@"去设置" en:@"Open Settings"];
-        btn.bezelStyle = NSBezelStyleRounded;
-        btn.target = self;
-        btn.action = NSSelectorFromString(row[@"action"]);
-        [root addSubview:btn];
-
         if ([row[@"tag"] integerValue] == 1) self.screenSwitch = sw;
-        if ([row[@"tag"] integerValue] == 2) self.axSwitch = sw;
-        if ([row[@"tag"] integerValue] == 3) self.micSwitch = sw;
-        if ([row[@"tag"] integerValue] == 4) self.camSwitch = sw;
-
-        y -= 58;
+        if ([row[@"tag"] integerValue] == 2) self.micSwitch = sw;
+        if ([row[@"tag"] integerValue] == 3) self.camSwitch = sw;
     }
 
-    self.permHint = [[NSTextField alloc] initWithFrame:NSMakeRect(40, 80, 880, 140)];
+    self.permHint = [[NSTextField alloc] initWithFrame:NSMakeRect(28, 92, 904, 160)];
     self.permHint.bezeled = NO;
     self.permHint.drawsBackground = NO;
     self.permHint.editable = NO;
     self.permHint.selectable = NO;
     self.permHint.lineBreakMode = NSLineBreakByWordWrapping;
     self.permHint.usesSingleLineMode = NO;
-    self.permHint.stringValue = [self L:@"说明:\n1. 打开授权页会自动检测当前权限状态。\n2. 点击开关会尝试触发授权请求；如果系统不允许直接弹框，会跳转到系统设置。\n3. 某些权限(如完全磁盘访问、自动化控制)无法通过公开 API 准确读取。"
-                                  en:@"Notes:\n1. Permission tab auto-detects current status.\n2. Toggling switch attempts permission request; if popup is unavailable, it opens System Settings.\n3. Some permissions (e.g. Full Disk Access, Automation) cannot be accurately read via public APIs."];
+    self.permHint.stringValue = [self L:@"说明:\n1. 本页会显示当前权限状态（开=已授权，关=未授权或未知）。\n2. 点击开关会尝试触发授权流程，部分权限会由系统引导到设置页。\n3. 完全磁盘访问等权限无法通过公开 API 精确读取。"
+                                  en:@"Notes:\n1. This page shows current permission status (on = granted, off = not granted or unknown).\n2. Toggling a switch tries to trigger the authorization flow; some permissions are handled in System Settings.\n3. Some permissions (e.g. Full Disk Access) cannot be read accurately via public APIs."];
     self.permHint.autoresizingMask = NSViewWidthSizable;
     [root addSubview:self.permHint];
 
@@ -858,7 +1015,7 @@ static NSString *const kTelegentLangEN = @"en";
 }
 
 - (void)buildLogsTab {
-    NSTabViewItem *item = [[NSTabViewItem alloc] initWithIdentifier:@"logs"];
+    NSTabViewItem *item = [[NSTabViewItem alloc] initWithIdentifier:kTabLogs];
     item.label = [self L:@"日志" en:@"Logs"];
 
     NSView *root = [self makeTabContainer];
@@ -894,7 +1051,7 @@ static NSString *const kTelegentLangEN = @"en";
 }
 
 - (void)buildChatHistoryTab {
-    NSTabViewItem *item = [[NSTabViewItem alloc] initWithIdentifier:@"chat"];
+    NSTabViewItem *item = [[NSTabViewItem alloc] initWithIdentifier:kTabChat];
     item.label = [self L:@"对话" en:@"Chat"];
 
     NSView *root = [self makeTabContainer];
@@ -1019,7 +1176,7 @@ static NSString *const kTelegentLangEN = @"en";
 }
 
 - (void)buildCodexCheckTab {
-    NSTabViewItem *item = [[NSTabViewItem alloc] initWithIdentifier:@"codex-check"];
+    NSTabViewItem *item = [[NSTabViewItem alloc] initWithIdentifier:kTabCodexCheck];
     item.label = [self L:@"依赖检查" en:@"Dependency Check"];
 
     NSView *root = [self makeTabContainer];
@@ -1131,7 +1288,7 @@ static NSString *const kTelegentLangEN = @"en";
 }
 
 - (void)buildMemoryAgentsTab {
-    NSTabViewItem *item = [[NSTabViewItem alloc] initWithIdentifier:@"memory"];
+    NSTabViewItem *item = [[NSTabViewItem alloc] initWithIdentifier:kTabMemory];
     item.label = [self L:@"记忆&Agent" en:@"Memory & Agent"];
 
     NSView *root = [self makeTabContainer];
@@ -1212,21 +1369,71 @@ static NSString *const kTelegentLangEN = @"en";
     self.configHint.stringValue = [self L:@"配置存储: App 内部 (NSUserDefaults)" en:@"Config storage: App internal (NSUserDefaults)"];
 }
 
-- (void)saveConfig {
+- (BOOL)persistConfigAndInitializeSkills {
     NSMutableDictionary<NSString *, NSString *> *out = [NSMutableDictionary dictionary];
-    NSArray<NSString *> *ordered = @[@"TELEGRAM_BOT_TOKEN", @"TELEGRAM_ALLOWED_USER_ID", @"AGENT_PROVIDER", @"AGENT_BIN", @"AGENT_ARGS", @"AGENT_MODEL", @"AGENT_SUPPORTS_IMAGE", @"WHISPER_PYTHON_BIN", @"FASTER_WHISPER_MODEL", @"FASTER_WHISPER_LANGUAGE", @"FASTER_WHISPER_COMPUTE_TYPE", @"CODEX_WORKDIR", @"CODEX_TIMEOUT_SEC", @"MAX_REPLY_CHARS", @"CODEX_SANDBOX", @"CODEX_MODEL", @"TMPDIR", @"IMAGE_DIR", @"CHAT_LOG_FILE", @"SESSION_STORE_FILE", @"MEMORY_FILE"];
+    NSArray<NSString *> *ordered = @[@"TELEGRAM_BOT_TOKEN", @"TELEGRAM_ALLOWED_USER_ID", @"AGENT_PROVIDER", @"AGENT_BIN", @"AGENT_ARGS", @"AGENT_MODEL", @"AGENT_SUPPORTS_IMAGE", @"SKILLS_INIT_DIR", @"WHISPER_PYTHON_BIN", @"FASTER_WHISPER_MODEL", @"FASTER_WHISPER_LANGUAGE", @"FASTER_WHISPER_COMPUTE_TYPE", @"CODEX_WORKDIR", @"CODEX_TIMEOUT_SEC", @"MAX_REPLY_CHARS", @"CODEX_SANDBOX", @"CODEX_MODEL", @"TMPDIR", @"IMAGE_DIR", @"CHAT_LOG_FILE", @"SESSION_STORE_FILE", @"MEMORY_FILE"];
     for (NSString *key in ordered) {
         NSString *val = [self.configFields[key].stringValue stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
         if (val.length > 0) {
             out[key] = val;
         }
     }
+
+    NSString *rawWorkdir = [self.configFields[@"CODEX_WORKDIR"].stringValue stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    if (rawWorkdir.length == 0) {
+        [self showError:[self L:@"请先设置 CODEX_WORKDIR（工作目录）。" en:@"Please set CODEX_WORKDIR (workspace) first."]];
+        self.configHint.stringValue = [self L:@"保存失败：工作目录为空" en:@"Save failed: workspace is empty"];
+        return NO;
+    }
+    NSString *normalizedWorkdir = [self.bridge normalizedWorkdirPathFromRaw:rawWorkdir];
+    if (normalizedWorkdir.length == 0) {
+        [self showError:[self L:@"CODEX_WORKDIR 无效或目录不存在，请重新选择。" en:@"Invalid CODEX_WORKDIR or folder does not exist."]];
+        self.configHint.stringValue = [self L:@"保存失败：工作目录无效" en:@"Save failed: invalid workspace"];
+        return NO;
+    }
+    out[@"CODEX_WORKDIR"] = normalizedWorkdir;
+
     [self.bridge saveStoredConfig:out];
-    self.configHint.stringValue = [self L:@"已保存到 App 内部配置" en:@"Saved to app internal config"];
+    NSError *initErr = nil;
+    if (![self.bridge initializeSkillsInWorkspace:normalizedWorkdir error:&initErr]) {
+        [self showError:initErr.localizedDescription ?: [self L:@"初始化 SKILLS 失败" en:@"Failed to initialize SKILLS"]];
+        self.configHint.stringValue = [self L:@"已保存配置，但 SKILLS 初始化失败" en:@"Saved config, but SKILLS init failed"];
+        return NO;
+    }
+    [self reloadConfig];
+    self.configHint.stringValue = [self L:@"已保存并初始化 SKILLS" en:@"Saved config and initialized SKILLS"];
+    return YES;
+}
+
+- (void)saveConfig {
+    [self persistConfigAndInitializeSkills];
+}
+
+- (void)chooseWorkdirFolder {
+    NSOpenPanel *panel = [NSOpenPanel openPanel];
+    panel.canChooseDirectories = YES;
+    panel.canChooseFiles = NO;
+    panel.allowsMultipleSelection = NO;
+    panel.canCreateDirectories = YES;
+    panel.prompt = [self L:@"选择" en:@"Select"];
+    panel.message = [self L:@"请选择 telegent 的工作目录（保存后会按配置初始化 SKILLS 目录）。" en:@"Choose telegent workspace folder (SKILLS will be initialized per config after saving)."];
+    NSString *current = [self.bridge normalizedWorkdirPathFromRaw:self.configFields[@"CODEX_WORKDIR"].stringValue];
+    if (current.length > 0) {
+        panel.directoryURL = [NSURL fileURLWithPath:current];
+    } else {
+        panel.directoryURL = [NSURL fileURLWithPath:NSHomeDirectory()];
+    }
+    NSModalResponse result = [panel runModal];
+    if (result != NSModalResponseOK || panel.URL == nil) {
+        return;
+    }
+    self.configFields[@"CODEX_WORKDIR"].stringValue = panel.URL.path ?: @"";
 }
 
 - (void)saveAndRestart {
-    [self saveConfig];
+    if (![self persistConfigAndInitializeSkills]) {
+        return;
+    }
     NSError *err = [self.bridge restart];
     if (err) {
         self.configHint.stringValue = [self L:@"保存成功，但重启失败" en:@"Saved, but restart failed"];
@@ -1674,8 +1881,7 @@ static NSString *const kTelegentLangEN = @"en";
 
 - (void)windowDidResize:(NSNotification *)notification {
     if (notification.object != self.controlWindow) return;
-    if ([self.tabView.selectedTabViewItem.identifier isKindOfClass:[NSString class]] &&
-        [self.tabView.selectedTabViewItem.identifier isEqualToString:@"chat"]) {
+    if ([self isChatTabSelected]) {
         [self reloadChatHistoryIfNeeded:YES];
     }
 }
@@ -1910,13 +2116,10 @@ static NSString *const kTelegentLangEN = @"en";
 
 - (void)refreshPermissions {
     BOOL screen = [self isScreenRecordingGranted];
-    NSDictionary *axOpts = @{(__bridge id)kAXTrustedCheckOptionPrompt: @NO};
-    BOOL ax = AXIsProcessTrustedWithOptions((__bridge CFDictionaryRef)axOpts);
     AVAuthorizationStatus mic = [AVCaptureDevice authorizationStatusForMediaType:AVMediaTypeAudio];
     AVAuthorizationStatus cam = [AVCaptureDevice authorizationStatusForMediaType:AVMediaTypeVideo];
 
     self.screenSwitch.state = screen ? NSControlStateValueOn : NSControlStateValueOff;
-    self.axSwitch.state = ax ? NSControlStateValueOn : NSControlStateValueOff;
     self.micSwitch.state = (mic == AVAuthorizationStatusAuthorized) ? NSControlStateValueOn : NSControlStateValueOff;
     self.camSwitch.state = (cam == AVAuthorizationStatusAuthorized) ? NSControlStateValueOn : NSControlStateValueOff;
 }
@@ -1964,10 +2167,6 @@ static NSString *const kTelegentLangEN = @"en";
     [self refreshPermissions];
 }
 
-- (void)openAccessibilitySettings {
-    [[NSWorkspace sharedWorkspace] openURL:[NSURL URLWithString:@"x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility"]];
-}
-
 - (void)openMicrophoneSettings {
     [[NSWorkspace sharedWorkspace] openURL:[NSURL URLWithString:@"x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone"]];
 }
@@ -1984,15 +2183,11 @@ static NSString *const kTelegentLangEN = @"en";
         }
         [self openScreenRecordingSettings];
     } else if (tag == 2) {
-        NSDictionary *opts = @{(__bridge id)kAXTrustedCheckOptionPrompt: @YES};
-        AXIsProcessTrustedWithOptions((__bridge CFDictionaryRef)opts);
-        [self openAccessibilitySettings];
-    } else if (tag == 3) {
         [AVCaptureDevice requestAccessForMediaType:AVMediaTypeAudio completionHandler:^(__unused BOOL granted) {
             dispatch_async(dispatch_get_main_queue(), ^{ [self refreshPermissions]; });
         }];
         [self openMicrophoneSettings];
-    } else if (tag == 4) {
+    } else if (tag == 3) {
         [AVCaptureDevice requestAccessForMediaType:AVMediaTypeVideo completionHandler:^(__unused BOOL granted) {
             dispatch_async(dispatch_get_main_queue(), ^{ [self refreshPermissions]; });
         }];
@@ -2068,7 +2263,7 @@ static NSString *const kTelegentLangEN = @"en";
     if ([self isPermissionTabSelected]) {
         [self refreshPermissions];
     }
-    if ([self isChatTabSelected]) {
+    if ([self.controlWindow isVisible] && [self isChatTabSelected]) {
         NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
         if (now - self.chatHistoryLastPollTs >= self.chatHistoryPollInterval) {
             self.chatHistoryLastPollTs = now;
@@ -2093,26 +2288,74 @@ static NSString *const kTelegentLangEN = @"en";
     self.restartItem.enabled = running;
 }
 
-- (BOOL)isPermissionTabSelected {
+- (void)windowDidBecomeKey:(NSNotification *)notification {
+    if (notification.object != self.controlWindow) return;
+    [self refreshSelectedTabForFocus];
+}
+
+- (NSString *)selectedTabIdentifier {
     id ident = self.tabView.selectedTabViewItem.identifier;
-    return [ident isKindOfClass:[NSString class]] && [(NSString *)ident isEqualToString:@"perm"];
+    if ([ident isKindOfClass:[NSString class]]) {
+        return (NSString *)ident;
+    }
+    return @"";
+}
+
+- (void)refreshTabWithIdentifier:(NSString *)identifier force:(BOOL)force {
+    if (identifier.length == 0) return;
+    if ([identifier isEqualToString:kTabConfig]) {
+        [self reloadConfig];
+        return;
+    }
+    if ([identifier isEqualToString:kTabPermission]) {
+        [self refreshPermissions];
+        return;
+    }
+    if ([identifier isEqualToString:kTabLogs]) {
+        [self reloadRuntimeLog];
+        return;
+    }
+    if ([identifier isEqualToString:kTabChat]) {
+        [self reloadChatHistoryIfNeeded:force];
+        return;
+    }
+    if ([identifier isEqualToString:kTabCodexCheck]) {
+        [self runCodexCheck];
+        return;
+    }
+    if ([identifier isEqualToString:kTabMemory]) {
+        [self reloadMemoryAgents];
+    }
+}
+
+- (void)refreshSelectedTabForFocus {
+    [self refreshTabForAutoEventWithIdentifier:[self selectedTabIdentifier] force:YES];
+}
+
+- (void)refreshTabForAutoEventWithIdentifier:(NSString *)identifier force:(BOOL)force {
+    if (identifier.length == 0) return;
+    NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
+    BOOL sameTab = (self.lastAutoRefreshTabIdentifier.length > 0 && [self.lastAutoRefreshTabIdentifier isEqualToString:identifier]);
+    if (sameTab && (now - self.lastAutoRefreshAt) < 0.30) {
+        return;
+    }
+    self.lastAutoRefreshTabIdentifier = identifier;
+    self.lastAutoRefreshAt = now;
+    [self refreshTabWithIdentifier:identifier force:force];
+}
+
+- (BOOL)isPermissionTabSelected {
+    return [[self selectedTabIdentifier] isEqualToString:kTabPermission];
 }
 
 - (BOOL)isChatTabSelected {
-    id ident = self.tabView.selectedTabViewItem.identifier;
-    return [ident isKindOfClass:[NSString class]] && [(NSString *)ident isEqualToString:@"chat"];
+    return [[self selectedTabIdentifier] isEqualToString:kTabChat];
 }
 
 - (void)tabView:(NSTabView *)tabView didSelectTabViewItem:(nullable NSTabViewItem *)tabViewItem {
     (void)tabView;
-    if ([tabViewItem.identifier isKindOfClass:[NSString class]] &&
-        [(NSString *)tabViewItem.identifier isEqualToString:@"perm"]) {
-        [self refreshPermissions];
-    }
-    if ([tabViewItem.identifier isKindOfClass:[NSString class]] &&
-        [(NSString *)tabViewItem.identifier isEqualToString:@"chat"]) {
-        [self reloadChatHistoryIfNeeded:YES];
-    }
+    NSString *identifier = ([tabViewItem.identifier isKindOfClass:[NSString class]]) ? (NSString *)tabViewItem.identifier : @"";
+    [self refreshTabForAutoEventWithIdentifier:identifier force:YES];
 }
 
 - (void)showError:(NSString *)text {
@@ -2142,10 +2385,10 @@ static NSString *const kTelegentLangEN = @"en";
 - (void)openControlCenter { [self.controlWindow makeKeyAndOrderFront:nil]; [NSApp activateIgnoringOtherApps:YES]; }
 - (void)openRuntimeLog { [self.bridge openLog]; }
 - (void)openProjectFolder {
-    NSString *workspace = [self.bridge resolvedEnvironment][@"CODEX_WORKDIR"];
-    if (workspace.length == 0) workspace = self.bridge.repoRoot;
-    if (![workspace hasPrefix:@"/"]) {
-        workspace = [self.bridge.repoRoot stringByAppendingPathComponent:workspace];
+    NSString *workspace = [self.bridge resolvedWorkdirPath];
+    if (workspace.length == 0) {
+        [self showError:[self L:@"CODEX_WORKDIR 为空，请先在配置页选择工作目录。" en:@"CODEX_WORKDIR is empty. Please choose a workspace in Config first."]];
+        return;
     }
     [[NSWorkspace sharedWorkspace] openURL:[NSURL fileURLWithPath:workspace]];
 }

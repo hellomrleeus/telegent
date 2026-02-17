@@ -8,6 +8,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 )
@@ -28,12 +29,21 @@ func Run() {
 
 	log.Printf("starting telegram-codex bridge. workdir=%q provider=%q agent_bin=%q codex=%q", cfg.CodexWorkdir, cfg.AgentProvider, cfg.AgentBin, cfg.CodexBin)
 	startParentWatchdog(cfg)
+	chatQueue := make(chan telegramMessage, 128)
+
+	go func() {
+		for msg := range chatQueue {
+			handleMessage(cfg, msg)
+		}
+	}()
 
 	var offset int64
 	for {
 		updates, err := getUpdates(cfg, offset)
 		if err != nil {
-			log.Printf("getUpdates failed: %v", err)
+			if !isTelegramPollNoisyError(err) {
+				log.Printf("getUpdates failed: %v", err)
+			}
 			time.Sleep(3 * time.Second)
 			continue
 		}
@@ -43,9 +53,17 @@ func Run() {
 			if upd.Message == nil {
 				continue
 			}
-			handleMessage(cfg, *upd.Message)
+			chatQueue <- *upd.Message
 		}
 	}
+}
+
+func isTelegramPollNoisyError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(strings.TrimSpace(err.Error()))
+	return strings.HasSuffix(msg, ": eof") || strings.Contains(msg, " unexpected eof")
 }
 
 func startParentWatchdog(cfg bridgeConfig) {

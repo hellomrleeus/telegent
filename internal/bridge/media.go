@@ -35,13 +35,14 @@ func runAgentWithMedia(cfg bridgeConfig, chatID int64, msg telegramMessage, medi
 		if userInstruction != "" {
 			prompt = fmt.Sprintf("%s\n\n补充说明：%s", prompt, userInstruction)
 		}
-		out, _, err := runAgent(cfg, chatID, prompt, nil)
-		if err != nil {
-			return mediaProcessResult{}, err
-		}
 		userText := fmt.Sprintf("[%s] %s", media.Kind, strings.TrimSpace(transcript))
 		if userInstruction != "" {
 			userText = fmt.Sprintf("%s\n%s", userText, userInstruction)
+		}
+
+		out, _, err := runAgent(cfg, chatID, prompt, nil)
+		if err != nil {
+			return mediaProcessResult{}, err
 		}
 		return mediaProcessResult{Output: out, UserText: strings.TrimSpace(userText)}, nil
 	}
@@ -243,11 +244,18 @@ func handleScreenshotRequest(cfg bridgeConfig, msg telegramMessage) error {
 	if err != nil {
 		return err
 	}
-	if err := sendPhoto(cfg, msg.Chat.ID, path, ""); err != nil {
-		if err2 := sendDocument(cfg, msg.Chat.ID, path, filepath.Base(path)); err2 != nil {
-			return fmt.Errorf("screenshot upload failed: photo=%v document=%v", err, err2)
-		}
+	if err := sendImageWithFallback(cfg, msg.Chat.ID, path, ""); err != nil {
+		return err
 	}
 	appendChatLogWithOptions(cfg, msg, "", "screenshot_ok", chatLogOptions{UserText: "", KeepUserText: true, BotMediaPath: path})
+	return nil
+}
+
+func sendImageWithFallback(cfg bridgeConfig, chatID int64, filePath string, caption string) error {
+	if err := sendPhoto(cfg, chatID, filePath, caption); err != nil {
+		if err2 := sendDocument(cfg, chatID, filePath, filepath.Base(filePath)); err2 != nil {
+			return fmt.Errorf("image upload failed: photo=%v document=%v", err, err2)
+		}
+	}
 	return nil
 }

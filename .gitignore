@@ -24,3 +24,4 @@ secrets/
 
 # macOS/iCloud temp artifacts
 .!*
+.codex

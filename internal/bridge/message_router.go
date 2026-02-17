@@ -162,6 +162,11 @@ func processIncomingMedia(cfg bridgeConfig, msg telegramMessage) bool {
 	if !envelope.Handled {
 		return false
 	}
+	if strings.TrimSpace(envelope.Opts.BotMediaPath) != "" {
+		if err := sendImageWithFallback(cfg, msg.Chat.ID, envelope.Opts.BotMediaPath, "执行结果截图"); err != nil {
+			_ = sendMessage(cfg, msg.Chat.ID, trimForTelegram("发送执行截图失败: "+err.Error(), cfg.MaxReplyChars))
+		}
+	}
 	_ = sendMessage(cfg, msg.Chat.ID, envelope.Resp)
 	appendChatLogWithOptions(cfg, msg, envelope.Resp, envelope.Tag, envelope.Opts)
 	return true
@@ -188,8 +193,9 @@ func processIncomingMediaCore(cfg bridgeConfig, msg telegramMessage, runMedia ru
 			Resp:    resp,
 			Tag:     "media_output",
 			Opts: chatLogOptions{
-				UserText:  mediaRes.UserText,
-				MediaPath: mediaRes.MediaPath,
+				UserText:     mediaRes.UserText,
+				MediaPath:    mediaRes.MediaPath,
+				BotMediaPath: mediaRes.BotMediaPath,
 			},
 		}
 	}
@@ -213,8 +219,9 @@ func processIncomingMediaCore(cfg bridgeConfig, msg telegramMessage, runMedia ru
 			Resp:    resp,
 			Tag:     "image_output",
 			Opts: chatLogOptions{
-				UserText:  imgRes.UserText,
-				MediaPath: imgRes.MediaPath,
+				UserText:     imgRes.UserText,
+				MediaPath:    imgRes.MediaPath,
+				BotMediaPath: imgRes.BotMediaPath,
 			},
 		}
 	}
@@ -232,9 +239,9 @@ func handleDefaultText(cfg bridgeConfig, msg telegramMessage, text string) {
 		return
 	}
 
-	out, _, err := runAgent(cfg, msg.Chat.ID, text, nil)
-	if err != nil {
-		resp := fmt.Sprintf("agent error:\n%s", trimForTelegram(err.Error(), cfg.MaxReplyChars))
+	out, _, agentErr := runAgent(cfg, msg.Chat.ID, text, nil)
+	if agentErr != nil {
+		resp := fmt.Sprintf("agent error:\n%s", trimForTelegram(agentErr.Error(), cfg.MaxReplyChars))
 		_ = sendMessage(cfg, msg.Chat.ID, resp)
 		appendChatLog(cfg, msg, resp, "agent_error")
 		return

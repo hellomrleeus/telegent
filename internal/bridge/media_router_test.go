@@ -118,3 +118,34 @@ func TestProcessIncomingMediaCore_ImageErrorWrapped(t *testing.T) {
 		t.Fatalf("expected original error in response: %q", env.Resp)
 	}
 }
+
+func TestProcessIncomingMediaCore_PropagatesBotMediaPath(t *testing.T) {
+	t.Parallel()
+
+	msg := telegramMessage{
+		Chat: telegramChat{ID: 1},
+		Voice: &telegramFileRef{
+			FileID: "voice-file",
+		},
+	}
+	cfg := bridgeConfig{MaxReplyChars: 3500}
+
+	env := processIncomingMediaCore(
+		cfg,
+		msg,
+		func(cfg bridgeConfig, chatID int64, msg telegramMessage, media mediaInput) (mediaProcessResult, error) {
+			return mediaProcessResult{Output: "ok", BotMediaPath: "/tmp/shot.png"}, nil
+		},
+		func(cfg bridgeConfig, chatID int64, image imageInput) (mediaProcessResult, error) {
+			t.Fatal("image handler should not be called")
+			return mediaProcessResult{}, nil
+		},
+	)
+
+	if !env.Handled {
+		t.Fatal("expected handled=true")
+	}
+	if env.Opts.BotMediaPath != "/tmp/shot.png" {
+		t.Fatalf("unexpected bot media path: %q", env.Opts.BotMediaPath)
+	}
+}

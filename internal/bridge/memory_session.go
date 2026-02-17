@@ -55,22 +55,54 @@ func isScreenshotRequest(text string) bool {
 	return false
 }
 
-func buildPromptWithMemory(cfg bridgeConfig, userPrompt string) string {
-	raw, err := os.ReadFile(resolveMemoryPath(cfg))
-	if err != nil {
-		return userPrompt
-	}
-	memory := strings.TrimSpace(string(raw))
-	if memory == "" {
+func buildPromptWithMemory(cfg bridgeConfig, userPrompt string, inject bool) string {
+	if !inject {
 		return userPrompt
 	}
 
-	return "Use the following persistent memory as user preferences/profile.\n" +
-		"Treat it as background context, but prioritize the user's latest explicit request.\n\n" +
-		"Persistent memory:\n" +
-		memory +
+	parts := make([]string, 0, 2)
+	if agentText := readAgentInstructions(cfg); agentText != "" {
+		parts = append(parts, "Agent instructions:\n"+agentText)
+	}
+	if memoryText := readMemoryForPrompt(cfg); memoryText != "" {
+		parts = append(parts, "Persistent memory:\n"+memoryText)
+	}
+	if len(parts) == 0 {
+		return userPrompt
+	}
+
+	return "Use the following context as background constraints/preferences.\n" +
+		"Prioritize the user's latest explicit request.\n\n" +
+		strings.Join(parts, "\n\n") +
 		"\n\nUser request:\n" +
 		userPrompt
+}
+
+func readMemoryForPrompt(cfg bridgeConfig) string {
+	raw, err := os.ReadFile(resolveMemoryPath(cfg))
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(raw))
+}
+
+func readAgentInstructions(cfg bridgeConfig) string {
+	candidates := []string{
+		filepath.Join(filepath.Dir(resolveMemoryPath(cfg)), "AGENTS.md"),
+		filepath.Join(cfg.CodexWorkdir, "AGENTS.md"),
+		filepath.Join(cfg.CodexWorkdir, "AGENT.md"),
+	}
+	for _, p := range candidates {
+		raw, err := os.ReadFile(p)
+		if err != nil {
+			continue
+		}
+		text := strings.TrimSpace(string(raw))
+		if text != "" {
+			return text
+		}
+	}
+	return ""
 }
 
 func parseSessionID(output string) string {

@@ -6,6 +6,7 @@ OUT_DIR="$ROOT/dist"
 APP_DIR="$OUT_DIR/$APP_NAME"
 MACOS="$APP_DIR/Contents/MacOS"
 RES="$APP_DIR/Contents/Resources"
+BUNDLE_ID="${BUNDLE_ID:-com.xlee.telegent}"
 VERSION_FILE="$ROOT/VERSION"
 APP_VERSION="0.1.0"
 if [[ -f "$VERSION_FILE" ]]; then
@@ -37,7 +38,7 @@ cat > "$APP_DIR/Contents/Info.plist" <<PLIST
   <key>CFBundleIconFile</key>
   <string>AppIcon</string>
   <key>CFBundleIdentifier</key>
-  <string>com.xlee.telegent</string>
+  <string>${BUNDLE_ID}</string>
   <key>CFBundleInfoDictionaryVersion</key>
   <string>6.0</string>
   <key>CFBundleName</key>
@@ -76,7 +77,21 @@ done
 
 xattr -cr "$APP_DIR"
 if [[ "${ENABLE_CODESIGN:-0}" == "1" ]]; then
-  codesign --force --deep -s - "$APP_DIR"
+  SIGN_ID="${CODESIGN_IDENTITY:-}"
+  if [[ -z "$SIGN_ID" ]]; then
+    SIGN_ID="-"
+    echo "[WARN] ENABLE_CODESIGN=1 but CODESIGN_IDENTITY is empty; falling back to ad-hoc signing."
+    echo "[WARN] Ad-hoc signing usually causes macOS TCC permissions (Screen Recording/Accessibility) to be re-authorized after rebuild."
+  fi
+
+  # Sign nested executables first, then the app bundle.
+  codesign --force --sign "$SIGN_ID" --identifier "${BUNDLE_ID}.whisper" "$MACOS/transcribe_faster_whisper.py"
+  codesign --force --sign "$SIGN_ID" --identifier "${BUNDLE_ID}.core" "$MACOS/telegent-core"
+  codesign --force --sign "$SIGN_ID" --identifier "${BUNDLE_ID}.launcher" "$MACOS/telegent"
+  codesign --force --sign "$SIGN_ID" --identifier "$BUNDLE_ID" "$APP_DIR"
+
+  echo "Code signing identity: $SIGN_ID"
+  /usr/bin/codesign --verify --deep "$APP_DIR"
 fi
 
 echo "Built: $APP_DIR"

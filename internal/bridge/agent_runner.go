@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -25,15 +26,26 @@ type agentRunner interface {
 
 func runAgent(cfg bridgeConfig, chatID int64, prompt string, imagePaths []string) (string, string, error) {
 	runner := selectRunner(cfg)
-	finalPrompt := buildPromptWithMemory(cfg, prompt)
+	existingSessionID := strings.TrimSpace(getChatSessionID(runner.Name(), chatID))
+	finalPrompt := buildPromptWithMemory(cfg, prompt, existingSessionID == "")
 	processedPrompt, processedImages, err := preprocessForRunner(cfg, runner, finalPrompt, imagePaths)
 	if err != nil {
+		log.Printf("[agent] preprocess failed provider=%s chat_id=%d err=%v", runner.Name(), chatID, err)
 		return "", "", err
 	}
+
+	log.Printf("[agent] request provider=%s chat_id=%d images=%d session=%q inject_context=%t", runner.Name(), chatID, len(processedImages), existingSessionID, existingSessionID == "")
+	if len(processedImages) > 0 {
+		log.Printf("[agent] image_paths provider=%s chat_id=%d paths=%q", runner.Name(), chatID, processedImages)
+	}
+	log.Printf("[agent] prompt begin provider=%s chat_id=%d\n%s\n[agent] prompt end provider=%s chat_id=%d", runner.Name(), chatID, processedPrompt, runner.Name(), chatID)
 	res, err := runner.Run(cfg, chatID, processedPrompt, processedImages)
 	if err != nil {
+		log.Printf("[agent] response error provider=%s chat_id=%d err=%v", runner.Name(), chatID, err)
 		return "", "", err
 	}
+
+	log.Printf("[agent] response provider=%s chat_id=%d session=%q output begin\n%s\n[agent] response provider=%s chat_id=%d output end", runner.Name(), chatID, strings.TrimSpace(res.SessionID), strings.TrimSpace(res.Output), runner.Name(), chatID)
 	if strings.TrimSpace(res.SessionID) != "" {
 		setChatSessionID(cfg, runner.Name(), chatID, strings.TrimSpace(res.SessionID))
 	}
@@ -92,11 +104,14 @@ func runCodexWithImages(cfg bridgeConfig, chatID int64, prompt string, imagePath
 
 	err := cmd.Run()
 	if ctx.Err() == context.DeadlineExceeded {
+		log.Printf("[codex] timeout chat_id=%d session=%q args=%q", chatID, existingSessionID, args)
 		return "", existingSessionID, fmt.Errorf("timeout after %d seconds", cfg.TimeoutSec)
 	}
 	if err != nil {
+		log.Printf("[codex] exec failed chat_id=%d session=%q args=%q output=%q err=%v", chatID, existingSessionID, args, combined.String(), err)
 		return "", existingSessionID, fmt.Errorf("%v\n%s", err, combined.String())
 	}
+	log.Printf("[codex] exec ok chat_id=%d session_before=%q session_after=%q args=%q raw_output begin\n%s\n[codex] exec ok chat_id=%d raw_output end", chatID, existingSessionID, parseSessionID(combined.String()), args, combined.String(), chatID)
 
 	actualSessionID := parseSessionID(combined.String())
 	if actualSessionID == "" {
@@ -108,16 +123,20 @@ func runCodexWithImages(cfg bridgeConfig, chatID int64, prompt string, imagePath
 		if err == nil {
 			final := strings.TrimSpace(string(lastMsg))
 			if final != "" {
+				log.Printf("[codex] output-last-message chat_id=%d session=%q value begin\n%s\n[codex] output-last-message chat_id=%d value end", chatID, actualSessionID, final, chatID)
 				return final, actualSessionID, nil
 			}
 		}
 	}
 
 	if resumed := extractAssistantReply(combined.String()); resumed != "" {
+		log.Printf("[codex] extracted assistant reply chat_id=%d session=%q value begin\n%s\n[codex] extracted assistant reply chat_id=%d value end", chatID, actualSessionID, resumed, chatID)
 		return resumed, actualSessionID, nil
 	}
 
-	return cleanCodexOutput(combined.String()), actualSessionID, nil
+	clean := cleanCodexOutput(combined.String())
+	log.Printf("[codex] clean output chat_id=%d session=%q value begin\n%s\n[codex] clean output chat_id=%d value end", chatID, actualSessionID, clean, chatID)
+	return clean, actualSessionID, nil
 }
 
 type codexRunner struct{}
@@ -201,10 +220,13 @@ func (g genericRunner) Run(cfg bridgeConfig, chatID int64, prompt string, imageP
 	cmd.Stderr = &out
 	if err := cmd.Run(); err != nil {
 		if ctx.Err() == context.DeadlineExceeded {
+			log.Printf("[agent-generic] timeout provider=%s chat_id=%d args=%q", g.Name(), chatID, args)
 			return agentRunResult{}, fmt.Errorf("timeout after %d seconds", cfg.TimeoutSec)
 		}
+		log.Printf("[agent-generic] exec failed provider=%s chat_id=%d args=%q output=%q err=%v", g.Name(), chatID, args, out.String(), err)
 		return agentRunResult{}, fmt.Errorf("%v\n%s", err, out.String())
 	}
+	log.Printf("[agent-generic] exec ok provider=%s chat_id=%d session=%q args=%q output begin\n%s\n[agent-generic] exec ok provider=%s chat_id=%d output end", g.Name(), chatID, sessionID, args, strings.TrimSpace(out.String()), g.Name(), chatID)
 	return agentRunResult{Output: strings.TrimSpace(out.String()), SessionID: sessionID}, nil
 }
 

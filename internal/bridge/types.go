@@ -87,7 +87,8 @@ type imageInput struct {
 }
 
 type mediaProcessResult struct {
-	Output    string
-	UserText  string
-	MediaPath string
+	Output       string
+	UserText     string
+	MediaPath    string
+	BotMediaPath string
 }
